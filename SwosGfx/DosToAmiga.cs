@@ -33,8 +33,8 @@ namespace SwosGfx
     public static class DosToAmiga
     {
         // All atlas banks are 320x256.
-        private const int BankWidth = 320;
-        private const int BankHeight = 256;
+        internal const int BankWidth = 320;
+        internal const int BankHeight = 256;
 
         // DOS sprite index = Amiga index + 114 for gameplay sprites (>= 227).
         private const int DosToAmigaOffset = 114;
@@ -60,9 +60,9 @@ namespace SwosGfx
         private const int LoadMenus = 0;         // in MenuBgScript
         private const int LoadMenus2 = 392;      // in MenuBgScript
 
-        private enum MapMode { GameplayPlus114, MenuIdentity }
+        internal enum MapMode { GameplayPlus114, MenuIdentity }
 
-        private sealed class Placement
+        internal sealed class Placement
         {
             public int AmigaIndex;
             public int X0, Y0;     // source pixel position inside the bank
@@ -126,7 +126,7 @@ namespace SwosGfx
         // Script interpreter (mirror of ProcessImageCommandStream, image_cmd.c)
         // ------------------------------------------------------------------
 
-        private static Dictionary<int, List<Placement>> Interpret(ushort[] s)
+        internal static Dictionary<int, List<Placement>> Interpret(ushort[] s)
         {
             var result = new Dictionary<int, List<Placement>>();
             int n = s.Length;
@@ -217,7 +217,7 @@ namespace SwosGfx
         // Bank rendering
         // ------------------------------------------------------------------
 
-        private static int RenderGlobalBank(
+        internal static int RenderGlobalBank(
             Dictionary<int, List<Placement>> byLoad, int loadOffset,
             DosSprite model, string outDir, string name, bool rsOffset,
             MapMode mode, uint[] palette)
@@ -314,7 +314,7 @@ namespace SwosGfx
         // 8bpp BMP writer
         // ------------------------------------------------------------------
 
-        private static void WriteBankBmp(string path, byte[] topDownPixels, uint[] palette)
+        internal static void WriteBankBmp(string path, byte[] topDownPixels, uint[] palette)
         {
             const int fileHeader = 14, infoHeader = 40, paletteBytes = 256 * 4;
             int width = BankWidth, height = BankHeight;

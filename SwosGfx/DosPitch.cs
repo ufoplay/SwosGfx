@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
 using static RncProPack.RncProcessor;
 
 namespace SwosGfx
@@ -20,6 +19,48 @@ namespace SwosGfx
         Normal = 4,
         Dry = 5,
         Hard = 6
+    }
+
+    /// <summary>
+    /// Options for the Tiled pitch export. The names mirror the equivalent Tiled2Bin
+    /// "-slice" switches so the two tools produce interchangeable maps.
+    /// </summary>
+    public sealed class PitchTiledOptions
+    {
+        /// <summary>
+        /// Reserve tile id 0 for an all-index-0 tile (Tiled2Bin -insertblanktile).
+        /// With this set the map never contains gid 0 ("no tile"): empty cells point
+        /// at the blank tile instead, so the map round-trips through Tiled and back
+        /// to a SWOS .MAP without holes.
+        /// </summary>
+        public bool InsertBlankTile;
+
+        /// <summary>Tileset image width in pixels (Tiled2Bin -tilesetwidth). Default 256 = 16 tiles across.</summary>
+        public int TilesetWidth = 256;
+
+        /// <summary>
+        /// Put the crowd on its own pair of layers ("crowd-sit" / "crowd-stand")
+        /// instead of leaving it in the pitch layer -- the v2 pitch format
+        /// (docs/PITCH_FORMAT_V2.md in SWOS United). Default on.
+        /// </summary>
+        public bool SplitCrowdLayers = true;
+
+        /// <summary>
+        /// Which pattern indices are fans. 1..22 is the engine's own rule
+        /// (MAX_FAN_TILE_INDEX) and holds for the Amiga maps and DOS pitches 1-5.
+        /// DOS pitch6 orders its patterns differently -- override with -fanrange=a-b.
+        /// </summary>
+        public int FirstFanPattern = DosPitch.DefaultFirstFanPattern;
+        public int LastFanPattern = DosPitch.DefaultLastFanPattern;
+
+        /// <summary>Set when -fanrange was given: use the range, skip the derivation.</summary>
+        public bool FanRangeExplicit;
+
+        /// <summary>
+        /// -derivefans: infer the fan patterns from the pitch instead of using the
+        /// engine's 1..22. Needed for DOS pitch6, over-selects on the others.
+        /// </summary>
+        public bool DeriveFans;
     }
 
     /// <summary>
@@ -53,10 +94,20 @@ namespace SwosGfx
 
         public const int PatternSize = 16;
         public const int Columns = 42; // 672 / 16
-        public const int Rows = 55;    // 880 / 16
+        public const int Rows = 55;
 
-        // Tileset layout for TMX export: 16 columns of 16x16 tiles
-        private const int TilesetColumns = 16;
+        /// <summary>
+        /// The engine's fan tiles: pitch pattern indices 1..22 (MAX_FAN_TILE_INDEX in
+        /// SWOS United's include/display.h), in consecutive odd/even pairs -- odd is
+        /// sitting, even is the same fans standing.
+        /// </summary>
+        public const int DefaultFirstFanPattern = 1;
+        public const int DefaultLastFanPattern = 22;
+
+        /// <summary>The two stands: the engine only ever animates fans here.</summary>
+        public const int FanPointerTableRow = 0;
+        public const int LastTopStandRow = 4;
+        public const int FirstBottomStandRow = 50;    // 880 / 16
 
         private readonly IDosPitchPatternSource _patterns;
 
@@ -108,26 +159,67 @@ namespace SwosGfx
             Write8bppIndexedBmp(path, Width, Height, indices, palette, colorCount);
         }
 
-        public void SavePitchAsTmx(int pitchIndex, PitchType pitchType, string path, int colorCount = 256)
+        public void SavePitchAsTiled(int pitchIndex, PitchType pitchType, string path, int colorCount = 256, PitchTiledOptions? options = null)
         {
             if (path == null) throw new ArgumentNullException(nameof(path));
             if (pitchIndex < 0 || pitchIndex >= _patterns.MaxPitch)
                 throw new ArgumentOutOfRangeException(nameof(pitchIndex));
 
-            string fullTmxPath = Path.GetFullPath(path);
-            string tmxDir = Path.GetDirectoryName(fullTmxPath) ?? ".";
-            string baseName = Path.GetFileNameWithoutExtension(fullTmxPath);
-            string tilesBmpPath = Path.Combine(tmxDir, baseName + ".bmp");
+            options ??= new PitchTiledOptions();
+
+            int tilesetColumns = Math.Max(1, options.TilesetWidth / PatternSize);
+
+            string fullMapPath = Path.GetFullPath(path);
+            string mapDir = Path.GetDirectoryName(fullMapPath) ?? ".";
+            string baseName = Path.GetFileNameWithoutExtension(fullMapPath);
+            string tilesBmpPath = Path.Combine(mapDir, baseName + ".bmp");
 
             uint[] palette = DosPalette.GetPitchPalette(pitchType);
             int pointerCount = _patterns.GetPointerCount(pitchIndex);
 
-            // patternIndex -> tileId (0-based)
-            var patternToTileId = new Dictionary<int, int>();
+            // Tiles are deduplicated on pixel content (Tiled2Bin -slice -norepeat),
+            // not on pattern index: several pointer entries can resolve to distinct
+            // pattern slots that hold identical pixels.
+            var tileToId = new Dictionary<byte[], int>(TilePixelComparer.Instance);
             var tilePixels = new List<byte[]>(); // each is 16*16 bytes (indices)
 
-            // GID map for TMX (1-based tile IDs; 0 = empty)
-            int[,] gidMap = new int[Rows, Columns];
+            // GIDs for the map layer, row-major (1-based tile IDs; 0 = empty)
+            var gidMap = new int[Rows * Columns];
+
+            // The crowd, split onto its own pair of layers (docs/PITCH_FORMAT_V2.md).
+            // The engine's fans are pitch PATTERN indices 1..22 in consecutive
+            // odd/even pairs -- odd sitting, even standing -- and it animates a cell
+            // by stepping its pointer one tile either way. That +-1 does NOT survive
+            // this exporter: tiles are deduplicated on pixel content, so the tile
+            // after a sitting fan in the sheet is whatever happened to appear next.
+            // Hence two layers holding the two states of the same cells, which is
+            // also what a pitch author can see and edit.
+            var gidCrowdSit = new int[Rows * Columns];
+            var gidCrowdStand = new int[Rows * Columns];
+            int crowdCells = 0;
+
+            // -insertblanktile: tile id 0 is an all-index-0 tile, so cells with no
+            // pattern (a short pointer table) reference it instead of leaving a hole.
+            int blankGid = 0;
+
+            if (options.InsertBlankTile)
+            {
+                var blankTile = new byte[PatternSize * PatternSize];
+                tileToId[blankTile] = 0;
+                tilePixels.Add(blankTile);
+                blankGid = 1;
+            }
+
+            // Which patterns are fans, derived from this pitch rather than assumed.
+            // The engine hard-codes 1..22 (MAX_FAN_TILE_INDEX) and that is right for
+            // the Amiga maps and DOS pitches 1-5 -- but DOS pitch6 gives its two
+            // stands DIFFERENT tiles (top 0..9, bottom 202..210), so no single range
+            // can describe it. The rule that does: a fan pattern appears ONLY in the
+            // stand bands and pairs off odd/even with another such pattern, which is
+            // exactly the sit/stand pairing the engine animates.
+            HashSet<int> fanPatterns = options.SplitCrowdLayers
+                ? FanPatterns(pitchIndex, pointerCount, options)
+                : new HashSet<int>();
 
             for (int tileY = 0; tileY < Rows; tileY++)
             {
@@ -137,34 +229,82 @@ namespace SwosGfx
 
                     if (pointerIndex >= pointerCount)
                     {
-                        gidMap[tileY, tileX] = 0;
+                        gidMap[pointerIndex] = blankGid;
                         continue;
                     }
 
                     int patternIndex = _patterns.GetPatternIndexForPointer(pitchIndex, pointerIndex);
 
-                    if (!patternToTileId.TryGetValue(patternIndex, out int tileId))
+                    ReadOnlySpan<byte> pattern = _patterns.GetPatternBytes(pitchIndex, patternIndex);
+                    if (pattern.Length != PatternSize * PatternSize)
+                        throw new InvalidOperationException("Pattern must be 16x16 (256 bytes).");
+
+                    var tileData = new byte[PatternSize * PatternSize];
+                    pattern.CopyTo(tileData);
+
+                    if (!tileToId.TryGetValue(tileData, out int tileId))
                     {
-                        ReadOnlySpan<byte> pattern = _patterns.GetPatternBytes(pitchIndex, patternIndex);
-                        if (pattern.Length != PatternSize * PatternSize)
-                            throw new InvalidOperationException("Pattern must be 16x16 (256 bytes).");
-
-                        var tileData = new byte[PatternSize * PatternSize];
-                        pattern.CopyTo(tileData);
-
                         tileId = tilePixels.Count;
                         tilePixels.Add(tileData);
-                        patternToTileId[patternIndex] = tileId;
+                        tileToId[tileData] = tileId;
                     }
 
-                    gidMap[tileY, tileX] = tileId + 1;
+                    // Classify on the PATTERN index, never on the tile id: the two
+                    // line up by accident on pitch1-5 and are off by one on pitch6,
+                    // where -insertblanktile takes id 0.
+                    // ... and only in the stands. The fan range is an AMIGA fact:
+                    // DOS pitch6 lays its patterns out differently and uses 3, 4 and
+                    // 10..21 as ordinary grass, so an index test alone would scatter
+                    // "crowd" across the middle of the field. The bands are where the
+                    // engine looks for fans anyway (it picks by camera Y).
+                    // Row 0 is NOT scenery and NOT spectators: it is the fan POINTER
+                    // TABLE. The engine aliases slots 0..20 as fan group A and 21..41
+                    // as fan group B (FAN_PTR_TABLE_OFFSET/4 = 21, src/pitch.c step 3)
+                    // and walks those two groups to recolour the fans into the two
+                    // teams' kits -- which is why it holds one of every fan pattern
+                    // including the standing halves that nothing else references. The
+                    // camera clamps at y=16 (move_camera.c: newIntY < 0x10), exactly
+                    // one tile row, so it is never drawn either. v2 says which tiles
+                    // are whose with layers, so the row keeps its tiles for the old
+                    // loader but stays off the crowd layers.
+                    bool inStandBand = (tileY > FanPointerTableRow && tileY <= LastTopStandRow)
+                                       || tileY >= FirstBottomStandRow;
+
+                    if (inStandBand && fanPatterns.Contains(patternIndex))
+                    {
+                        int sitPattern = (patternIndex & 1) != 0 ? patternIndex : patternIndex - 1;
+                        gidCrowdSit[pointerIndex] = TileIdForPattern(pitchIndex, sitPattern, tileToId, tilePixels) + 1;
+                        gidCrowdStand[pointerIndex] = TileIdForPattern(pitchIndex, sitPattern + 1, tileToId, tilePixels) + 1;
+                        gidMap[pointerIndex] = 0;      // the crowd layer draws this cell
+                        crowdCells++;
+                        continue;
+                    }
+
+                    gidMap[pointerIndex] = tileId + 1;
                 }
             }
 
-            int tileCount = tilePixels.Count;
-            int tilesetRows = (tileCount + TilesetColumns - 1) / TilesetColumns;
+            // A pitch whose stands are mostly NOT in the fan range is telling us the
+            // range is wrong for it (DOS pitch6). Say so rather than shipping a crowd
+            // layer with holes in it -- a silent wrong answer here would not surface
+            // until the ground half-animated in a match.
+            if (options.SplitCrowdLayers)
+            {
+                int standCells = 0;
+                for (int ty = 0; ty < Rows; ty++)
+                    if (ty <= LastTopStandRow || ty >= FirstBottomStandRow)
+                        standCells += Columns;
+                if (crowdCells * 2 < standCells)
+                    Console.Error.WriteLine(
+                        $"  warning: pitch{pitchIndex + 1}: only {crowdCells} of {standCells} stand cells " +
+                        $"are fan patterns {options.FirstFanPattern}..{options.LastFanPattern} - " +
+                        "the fan range looks wrong for this pitch (-fanrange=a-b)");
+            }
 
-            int tilesetWidth = TilesetColumns * PatternSize;
+            int tileCount = tilePixels.Count;
+            int tilesetRows = (tileCount + tilesetColumns - 1) / tilesetColumns;
+
+            int tilesetWidth = tilesetColumns * PatternSize;
             int tilesetHeight = tilesetRows * PatternSize;
 
             // Top-down tileset indices: [y,x]
@@ -173,8 +313,8 @@ namespace SwosGfx
             for (int tileId = 0; tileId < tileCount; tileId++)
             {
                 byte[] tileData = tilePixels[tileId];
-                int col = tileId % TilesetColumns;
-                int row = tileId / TilesetColumns;
+                int col = tileId % tilesetColumns;
+                int row = tileId / tilesetColumns;
 
                 int dstX0 = col * PatternSize;
                 int dstY0 = row * PatternSize;
@@ -192,42 +332,175 @@ namespace SwosGfx
             // Write tileset BMP
             Write8bppIndexedBmp(tilesBmpPath, tilesetWidth, tilesetHeight, tilesetIndices, palette, colorCount);
 
-            // Write TMX
-            var encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
-            Directory.CreateDirectory(tmxDir);
-
-            using var writer = new StreamWriter(fullTmxPath, false, encoding);
-
-            writer.WriteLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
-            writer.WriteLine("<map version=\"1.10\" tiledversion=\"1.10.2\" orientation=\"orthogonal\" renderorder=\"right-down\" " +
-                             $"width=\"{Columns}\" height=\"{Rows}\" tilewidth=\"{PatternSize}\" tileheight=\"{PatternSize}\" infinite=\"0\" nextlayerid=\"2\" nextobjectid=\"1\">");
-            writer.WriteLine($" <tileset firstgid=\"1\" name=\"tiles\" tilewidth=\"{PatternSize}\" tileheight=\"{PatternSize}\" tilecount=\"{tileCount}\" columns=\"{TilesetColumns}\">");
-            writer.WriteLine($"  <image source=\"{Path.GetFileName(tilesBmpPath)}\" width=\"{tilesetWidth}\" height=\"{tilesetHeight}\"/>");
-            writer.WriteLine(" </tileset>");
-            writer.WriteLine($" <layer id=\"1\" name=\"Tile Layer 1\" width=\"{Columns}\" height=\"{Rows}\">");
-            writer.WriteLine("  <data encoding=\"csv\">");
-
-            for (int y = 0; y < Rows; y++)
+            // Write the Tiled JSON map
+            TiledMap.Write(fullMapPath, new TiledMap.MapData
             {
-                for (int x = 0; x < Columns; x++)
-                {
-                    int gid = gidMap[y, x];
-                    bool lastCell = (y == Rows - 1) && (x == Columns - 1);
-
-                    writer.Write(gid);
-                    if (!lastCell) writer.Write(",");
-                    if (x == Columns - 1) writer.WriteLine();
-                }
-            }
-
-            writer.WriteLine("  </data>");
-            writer.WriteLine(" </layer>");
-            writer.WriteLine("</map>");
+                Width = Columns,
+                Height = Rows,
+                TileWidth = PatternSize,
+                TileHeight = PatternSize,
+                TileCount = tileCount,
+                Columns = tilesetColumns,
+                ImageSource = Path.GetFileName(tilesBmpPath),
+                ImageWidth = tilesetWidth,
+                ImageHeight = tilesetHeight,
+                Gids = gidMap,
+                FirstLayerName = crowdCells > 0 ? "pitch" : null,
+                Properties = crowdCells > 0 ? PitchLayerProperties() : new List<TiledMap.LayerProperty>(),
+                ExtraLayers = crowdCells > 0 ? CrowdLayers(gidCrowdSit, gidCrowdStand)
+                                             : new List<TiledMap.LayerData>()
+            });
         }
 
         // ---------------------------------------------------------------------
         // Internal helpers
         // ---------------------------------------------------------------------
+
+        /// <summary>
+        /// The fan patterns of one pitch: those used only in the stand bands, that
+        /// pair off odd/even with another such pattern (odd sitting, even standing).
+        /// An explicit -fanrange overrides the derivation.
+        /// </summary>
+        private HashSet<int> FanPatterns(int pitchIndex, int pointerCount, PitchTiledOptions options)
+        {
+            var result = new HashSet<int>();
+
+            // The ENGINE's rule by default, not a clever one of our own: fans are
+            // pattern indices 1..22 (MAX_FAN_TILE_INDEX), which is what the crowd
+            // animation actually tests, so a default export reproduces exactly the
+            // crowd the game animates today.
+            //
+            // -derivefans instead infers them: patterns used only in the stand bands
+            // that pair off odd/even. That reproduces 1..22 on pitches 1-5 AND finds
+            // DOS pitch6's two disjoint sets (top 1,2,5..8; bottom 203..210) -- but it
+            // also picks up the hoarding and barrier rows the engine never touches, so
+            // it is opt-in until someone decides what pitch6's crowd should be.
+            if (!options.DeriveFans)
+            {
+                for (int p = options.FirstFanPattern; p <= options.LastFanPattern; p++)
+                    result.Add(p);
+                return result;
+            }
+
+            if (options.FanRangeExplicit)
+            {
+                for (int p = options.FirstFanPattern; p <= options.LastFanPattern; p++)
+                    result.Add(p);
+                return result;
+            }
+
+            var inStands = new HashSet<int>();
+            var inField = new HashSet<int>();
+            for (int pointerIndex = 0; pointerIndex < pointerCount && pointerIndex < Rows * Columns; pointerIndex++)
+            {
+                int row = pointerIndex / Columns;
+                int pattern = _patterns.GetPatternIndexForPointer(pitchIndex, pointerIndex);
+                if (row <= LastTopStandRow || row >= FirstBottomStandRow) inStands.Add(pattern);
+                else inField.Add(pattern);
+            }
+            inStands.ExceptWith(inField);
+
+            foreach (int p in inStands)
+                if ((p & 1) != 0 && inStands.Contains(p + 1))
+                {
+                    result.Add(p);        // sitting
+                    result.Add(p + 1);    // ... and the same fans standing
+                }
+
+            return result;
+        }
+
+        /// <summary>
+        /// The tile id for a pattern index, adding its pixels to the sheet if nothing
+        /// has used them yet. The standing half of a fan pair is often not referenced
+        /// by the map at all -- the pitch ships with the whole ground seated -- so it
+        /// has to be brought in deliberately or the crowd would have nothing to stand
+        /// up into.
+        /// </summary>
+        private int TileIdForPattern(int pitchIndex, int patternIndex,
+                                     Dictionary<byte[], int> tileToId, List<byte[]> tilePixels)
+        {
+            ReadOnlySpan<byte> pattern = _patterns.GetPatternBytes(pitchIndex, patternIndex);
+            if (pattern.Length != PatternSize * PatternSize)
+                throw new InvalidOperationException("Pattern must be 16x16 (256 bytes).");
+
+            var tileData = new byte[PatternSize * PatternSize];
+            pattern.CopyTo(tileData);
+
+            if (!tileToId.TryGetValue(tileData, out int tileId))
+            {
+                tileId = tilePixels.Count;
+                tilePixels.Add(tileData);
+                tileToId[tileData] = tileId;
+            }
+            return tileId;
+        }
+
+        private static List<TiledMap.LayerProperty> PitchLayerProperties() =>
+            new List<TiledMap.LayerProperty>
+            {
+                TiledMap.LayerProperty.Text("swos:role", "pitch"),
+                TiledMap.LayerProperty.Int("swos:z", -100),
+            };
+
+        /// <summary>
+        /// The two crowd layers. "crowd-stand" ships hidden: it is the other half of
+        /// every fan cell, which the engine swaps in as the ground stands up, and
+        /// showing both at once in an editor would just cover the seated one.
+        /// </summary>
+        private static List<TiledMap.LayerData> CrowdLayers(int[] sit, int[] stand) =>
+            new List<TiledMap.LayerData>
+            {
+                new TiledMap.LayerData
+                {
+                    Name = "crowd-sit", Gids = sit, Visible = true,
+                    Properties = new List<TiledMap.LayerProperty>
+                    {
+                        TiledMap.LayerProperty.Text("swos:role", "crowd-sit"),
+                        TiledMap.LayerProperty.Int("swos:z", -90),
+                    }
+                },
+                new TiledMap.LayerData
+                {
+                    Name = "crowd-stand", Gids = stand, Visible = false,
+                    Properties = new List<TiledMap.LayerProperty>
+                    {
+                        TiledMap.LayerProperty.Text("swos:role", "crowd-stand"),
+                        TiledMap.LayerProperty.Int("swos:z", -90),
+                    }
+                },
+            };
+
+        /// <summary>Exact (not hash-only) equality over 16x16 tile pixels, for tile deduplication.</summary>
+        private sealed class TilePixelComparer : IEqualityComparer<byte[]>
+        {
+            public static readonly TilePixelComparer Instance = new TilePixelComparer();
+
+            public bool Equals(byte[]? a, byte[]? b)
+            {
+                if (ReferenceEquals(a, b)) return true;
+                if (a == null || b == null || a.Length != b.Length) return false;
+
+                for (int i = 0; i < a.Length; i++)
+                    if (a[i] != b[i]) return false;
+
+                return true;
+            }
+
+            public int GetHashCode(byte[] tile)
+            {
+                // FNV-1a
+                uint hash = 2166136261u;
+
+                for (int i = 0; i < tile.Length; i++)
+                {
+                    hash ^= tile[i];
+                    hash *= 16777619u;
+                }
+
+                return unchecked((int)hash);
+            }
+        }
 
         private static void BlitPattern(ReadOnlySpan<byte> pattern, byte[,] destIndices, int destX, int destY)
         {

@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
-using System.Xml.Linq;
 using static SwosGfx.AmigaPalette;
 
 namespace SwosGfx
@@ -125,7 +123,7 @@ namespace SwosGfx
         // BMP helper: 4/8bpp indexed, no System.Drawing
         // ------------------------------------------------------------------
 
-        private static class Bmp8Helper
+        internal static class Bmp8Helper
         {
             private const ushort BmpMagic = 0x4D42; // 'BM'
             private const int FileHeaderSize = 14;
@@ -393,8 +391,24 @@ namespace SwosGfx
             int spriteSizeBytes = SpriteRows * spriteRowBytes;      // 16 rows
 
             if (remaining % spriteSizeBytes != 0)
+            {
+                // The bit depth is not stored in the file, so a wrong -bitplanes is the
+                // usual cause. Say which depths the data would actually fit.
+                var fits = new List<int>();
+                for (int planes = 1; planes <= 8; planes++)
+                {
+                    if (remaining % (SpriteRows * BytesPerPlanePerRow16 * planes) == 0)
+                        fits.Add(planes);
+                }
+
+                string hint = fits.Count > 0
+                    ? $" The sprite data divides evenly at -bitplanes={string.Join(" or ", fits)}."
+                    : string.Empty;
+
                 throw new InvalidOperationException(
-                    $"MAP sprite data size ({remaining} bytes) is not a multiple of spriteSizeBytes={spriteSizeBytes} for {bitplanes} bitplanes.");
+                    $"MAP sprite data size ({remaining} bytes) is not a multiple of spriteSizeBytes={spriteSizeBytes} " +
+                    $"for {bitplanes} bitplanes.{hint}");
+            }
 
             int spriteCount = remaining / spriteSizeBytes;
             sprites = new List<PitchBitmapItem>(spriteCount);
@@ -587,12 +601,13 @@ namespace SwosGfx
 
             // 3) Build full pitch index buffer
             var fullIndices = new byte[PitchHeight, PitchWidth];
+            int offsetStride = DetectPitchOffsetStride(mapping, bitplanes, sprites.Count);
 
             for (int y = 0; y < PitchTilesY; y++)
             {
                 for (int x = 0; x < PitchTilesX; x++)
                 {
-                    int tileIndex = DecodePitchTileIndex(mapping[y, x], bitplanes, TileSize);
+                    int tileIndex = DecodePitchTileIndex(mapping[y, x], offsetStride);
 
                     if ((uint)tileIndex >= (uint)sprites.Count)
                         throw new InvalidOperationException(
@@ -618,13 +633,13 @@ namespace SwosGfx
         }
 
         // ------------------------------------------------------------------
-        // 2. PITCH MAP → Tiled TMX + tiles BMP (MAP-only, variable bitplanes)
+        // 2. PITCH MAP → Tiled JSON + tiles BMP (MAP-only, variable bitplanes)
         // ------------------------------------------------------------------
 
         /// <summary>
         /// Convert a SWOS pitch MAP file into:
-        ///   - a tileset BMP (MyPitch.bmp, same directory as TMX)
-        ///   - a Tiled TMX file with one layer that references those tiles.
+        ///   - a tileset BMP (MyPitch.bmp, same directory as the map)
+        ///   - a Tiled JSON map with one layer that references those tiles.
         ///
         /// Tiles are laid out in a tileset image with 16 columns of 16x16 tiles.
         /// Tile IDs in Tiled are 1-based and directly correspond to sprite indices + 1.
@@ -635,7 +650,7 @@ namespace SwosGfx
         public void ConvertPitchMapToTiled(
             string mapFilePath,
             uint[] palette,
-            string dstTmxPath,
+            string dstMapPath,
             uint[]? newPalette = null,
             int bitplanes = 4,
             int colorCount = 16)
@@ -671,59 +686,59 @@ namespace SwosGfx
                 }
             }
 
-            string tmxFullPath = Path.GetFullPath(dstTmxPath);
-            string tmxDir = Path.GetDirectoryName(tmxFullPath) ?? ".";
-            string baseName = Path.GetFileNameWithoutExtension(tmxFullPath);
-            string tilesBmpPath = Path.Combine(tmxDir, baseName + ".bmp");
+            string mapFullPath = Path.GetFullPath(dstMapPath);
+            string mapDir = Path.GetDirectoryName(mapFullPath) ?? ".";
+            string baseName = Path.GetFileNameWithoutExtension(mapFullPath);
+            string tilesBmpPath = Path.Combine(mapDir, baseName + ".bmp");
 
             // 3) Write tiles BMP
             Bmp8Helper.Write8bppBmpFromIndices(tilesBmpPath, tilesetIndices, palette, newPalette, colorCount);
 
-            // 4) Write TMX
-            var encoding = new UTF8Encoding(false);
-            using var writer = new StreamWriter(tmxFullPath, false, encoding);
-
-            writer.WriteLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
-            writer.WriteLine("<map version=\"1.10\" tiledversion=\"1.10.2\" orientation=\"orthogonal\" renderorder=\"right-down\" " +
-                             $"width=\"{PitchTilesX}\" height=\"{PitchTilesY}\" tilewidth=\"{TileSize}\" tileheight=\"{TileSize}\" infinite=\"0\" nextlayerid=\"2\" nextobjectid=\"1\">");
-            writer.WriteLine($" <tileset firstgid=\"1\" name=\"tiles\" tilewidth=\"{TileSize}\" tileheight=\"{TileSize}\" tilecount=\"{tileCount}\" columns=\"{destCols}\">");
-            writer.WriteLine($"  <image source=\"{Path.GetFileName(tilesBmpPath)}\" width=\"{imgWidth}\" height=\"{imgHeight}\"/>");
-            writer.WriteLine(" </tileset>");
-            writer.WriteLine($" <layer id=\"1\" name=\"Tile Layer 1\" width=\"{PitchTilesX}\" height=\"{PitchTilesY}\">");
-            writer.WriteLine("  <data encoding=\"csv\">");
+            // 4) Write the Tiled JSON map
+            var gids = new int[PitchTilesY * PitchTilesX];
+            int offsetStride = DetectPitchOffsetStride(mapping, bitplanes, tileCount);
 
             for (int y = 0; y < PitchTilesY; y++)
             {
                 for (int x = 0; x < PitchTilesX; x++)
                 {
-                    int tileIndex = DecodePitchTileIndex(mapping[y, x], bitplanes, TileSize);
-                    int gid = tileIndex + 1; // Tiled uses 1-based IDs; 0 is "empty"
+                    int tileIndex = DecodePitchTileIndex(mapping[y, x], offsetStride);
 
-                    bool lastCell = (y == PitchTilesY - 1) && (x == PitchTilesX - 1);
+                    if ((uint)tileIndex >= (uint)tileCount)
+                        throw new InvalidOperationException(
+                            $"Mapping refers to tileIndex {tileIndex} but the MAP holds {tileCount} tiles.");
 
-                    writer.Write(gid);
-                    if (!lastCell) writer.Write(",");
-                    if (x == PitchTilesX - 1) writer.WriteLine();
+                    gids[y * PitchTilesX + x] = tileIndex + 1; // Tiled uses 1-based IDs; 0 is "empty"
                 }
             }
 
-            writer.WriteLine("  </data>");
-            writer.WriteLine(" </layer>");
-            writer.WriteLine("</map>");
+            TiledMap.Write(mapFullPath, new TiledMap.MapData
+            {
+                Width = PitchTilesX,
+                Height = PitchTilesY,
+                TileWidth = TileSize,
+                TileHeight = TileSize,
+                TileCount = tileCount,
+                Columns = destCols,
+                ImageSource = Path.GetFileName(tilesBmpPath),
+                ImageWidth = imgWidth,
+                ImageHeight = imgHeight,
+                Gids = gids
+            });
         }
 
         // ------------------------------------------------------------------
-        // 3. Tiled TMX + tiles BMP → PITCH MAP (variable bitplanes)
+        // 3. Tiled map + tiles BMP → PITCH MAP (variable bitplanes)
         // ------------------------------------------------------------------
 
         /// <summary>
-        /// Convert a Tiled TMX file (plus its associated tiles BMP) back into
-        /// a SWOS MAP file.
+        /// Convert a Tiled map (plus its associated tiles BMP) back into a SWOS MAP
+        /// file. JSON maps are what SwosGfx writes; the older XML .tmx is also read.
         ///
         /// Requirements:
-        /// - TMX has a single tileset with a single image.
-        /// - TMX tilewidth/tileheight are 16x16.
-        /// - TMX width/height is 42x55.
+        /// - a single embedded tileset with a single image.
+        /// - tilewidth/tileheight are 16x16.
+        /// - map width/height is 42x55.
         /// - Tile IDs (gid) are >0 (no empty tiles) and reference a tileset image
         ///   that contains all tile graphics.
         ///
@@ -732,7 +747,7 @@ namespace SwosGfx
         ///     4 = original ECS/OCS 16-color; 8 = full 256-color AGA.
         /// </summary>
         public void ConvertTiledToPitchMap(
-            string tmxPath,
+            string tiledMapPath,
             string outputMapPath,
             int maxTiles = 284,
             int bitplanes = 4)
@@ -740,62 +755,25 @@ namespace SwosGfx
             if (bitplanes < 1 || bitplanes > 8)
                 throw new ArgumentOutOfRangeException(nameof(bitplanes), "Bitplanes must be between 1 and 8.");
 
-            string fullTmxPath = Path.GetFullPath(tmxPath);
-            var doc = XDocument.Load(fullTmxPath);
+            string fullMapPath = Path.GetFullPath(tiledMapPath);
+            TiledMap.MapData tiled = TiledMap.Read(fullMapPath);
 
-            var mapElem = doc.Element("map")
-                ?? throw new InvalidDataException("TMX: missing <map> root element.");
+            if (tiled.TileWidth != TileSize || tiled.TileHeight != TileSize)
+                throw new InvalidOperationException($"Tiled map tile size must be {TileSize}x{TileSize}.");
+            if (tiled.Width != PitchTilesX || tiled.Height != PitchTilesY)
+                throw new InvalidOperationException($"Tiled map dimensions must be {PitchTilesX}x{PitchTilesY}.");
 
-            int tileCols = (int)mapElem.Attribute("width");
-            int tileRows = (int)mapElem.Attribute("height");
-            int tileW = (int)mapElem.Attribute("tilewidth");
-            int tileH = (int)mapElem.Attribute("tileheight");
+            int tileCount = tiled.TileCount;
+            int columns = tiled.Columns;
+            int imageWidth = tiled.ImageWidth;
+            int imageHeight = tiled.ImageHeight;
 
-            if (tileW != TileSize || tileH != TileSize)
-                throw new InvalidOperationException($"TMX tile size must be {TileSize}x{TileSize}.");
-            if (tileCols != PitchTilesX || tileRows != PitchTilesY)
-                throw new InvalidOperationException($"TMX map dimensions must be {PitchTilesX}x{PitchTilesY}.");
+            string mapDir = Path.GetDirectoryName(fullMapPath) ?? ".";
+            string tilesBmpPath = Path.Combine(mapDir, tiled.ImageSource);
 
-            var tilesetElem = mapElem.Element("tileset")
-                ?? throw new InvalidDataException("TMX: missing <tileset> element.");
-            int tileCount = (int)tilesetElem.Attribute("tilecount");
-            int columns = (int)tilesetElem.Attribute("columns");
-
-            var imageElem = tilesetElem.Element("image")
-                ?? throw new InvalidDataException("TMX: missing <image> inside <tileset>.");
-            string imageSource = (string)imageElem.Attribute("source")
-                ?? throw new InvalidDataException("TMX: <image> missing 'source' attribute.");
-
-            int imageWidth = (int)imageElem.Attribute("width");
-            int imageHeight = (int)imageElem.Attribute("height");
-
-            string tmxDir = Path.GetDirectoryName(fullTmxPath) ?? ".";
-            string tilesBmpPath = Path.Combine(tmxDir, imageSource);
-
-            var layerElem = mapElem.Element("layer")
-                ?? throw new InvalidDataException("TMX: missing <layer> element.");
-            var dataElem = layerElem.Element("data")
-                ?? throw new InvalidDataException("TMX: missing <data> inside <layer>.");
-
-            string encoding = (string)dataElem.Attribute("encoding") ?? "";
-            if (!encoding.Equals("csv", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("TMX <data> encoding must be 'csv'.");
-
-            string csv = dataElem.Value ?? "";
-            var tokens = csv.Split(new[] { ',', ' ', '\r', '\n', '\t' },
-                                   StringSplitOptions.RemoveEmptyEntries);
-
-            if (tokens.Length != tileCols * tileRows)
-                throw new InvalidOperationException($"TMX: expected {tileCols * tileRows} tile IDs, got {tokens.Length}.");
-
-            int[,] gids = new int[tileRows, tileCols];
-            for (int i = 0; i < tokens.Length; i++)
-            {
-                int gid = int.Parse(tokens[i]);
-                int y = i / tileCols;
-                int x = i % tileCols;
-                gids[y, x] = gid;
-            }
+            int[,] gids = new int[tiled.Height, tiled.Width];
+            for (int i = 0; i < tiled.Gids.Length; i++)
+                gids[i / tiled.Width, i % tiled.Width] = tiled.Gids[i];
 
             // 1) Read tileset image
             uint[] tsPal;
@@ -806,7 +784,7 @@ namespace SwosGfx
                 out int tsheight);
 
             if (tsWidth != imageWidth || tsheight != imageHeight)
-                throw new InvalidOperationException("TMX: tileset image dimensions do not match <image> attributes.");
+                throw new InvalidOperationException("Tiled map: tileset image dimensions do not match the map's image size.");
 
             int tileSheetCols = columns;
             int tileSheetRows = imageHeight / TileSize;
@@ -819,7 +797,7 @@ namespace SwosGfx
                 int col = tileIndex % tileSheetCols;
                 int row = tileIndex / tileSheetCols;
                 if (row >= tileSheetRows)
-                    throw new InvalidOperationException("TMX: tileset image is too small for declared tilecount/columns.");
+                    throw new InvalidOperationException("Tiled map: tileset image is too small for the declared tilecount/columns.");
 
                 var tile = new PitchBitmapItem();
                 int srcX0 = col * TileSize;
@@ -845,11 +823,11 @@ namespace SwosGfx
                 {
                     int gid = gids[ty, tx];
                     if (gid <= 0)
-                        throw new InvalidOperationException("TMX: tile GID 0 (empty) encountered; SWOS MAP requires all tiles present.");
+                        throw new InvalidOperationException("Tiled map: tile GID 0 (empty) encountered; SWOS MAP requires all tiles present.");
 
                     int tileIndex = gid - 1; // 1-based gid → 0-based
                     if (tileIndex < 0 || tileIndex >= tileCount)
-                        throw new InvalidOperationException($"TMX: tile GID {gid} references out-of-range tile index {tileIndex}.");
+                        throw new InvalidOperationException($"Tiled map: tile GID {gid} references out-of-range tile index {tileIndex}.");
 
                     tileMatrix[ty, tx] = tileLibrary[tileIndex];
                 }
@@ -1107,25 +1085,82 @@ namespace SwosGfx
                 $"Expected {exp320} bytes for 320x256, or {exp352} bytes for 352x272.");
         }
 
-        static int DecodePitchTileIndex(Mapping m, int bitplanes, int tileSize)
+        /// <summary>Big-endian 32-bit tile reference stored in one mapping cell.</summary>
+        static uint ReadPitchMappingOffset(Mapping m)
         {
-            // Map stores big-endian 32-bit offset into the tile stream
-            uint offset =
-                ((uint)m.B1 << 24) |
-                ((uint)m.B2 << 16) |
-                ((uint)m.B3 << 8) |
-                (uint)m.B4;
+            return ((uint)m.B1 << 24) |
+                   ((uint)m.B2 << 16) |
+                   ((uint)m.B3 << 8) |
+                   (uint)m.B4;
+        }
 
-            int bytesPerTile = tileSize * bitplanes * 2; // 16x16 => 32*bitplanes
+        /// <summary>
+        /// Work out what unit a pitch MAP's mapping offsets are counted in.
+        ///
+        /// Each cell holds a 32-bit value identifying its tile. WritePitchMap emits a
+        /// true byte offset into the tile stream - tileIndex * 16 * bitplanes * 2 - but
+        /// AGA pitches also exist (including ones earlier SwosGfx builds produced) whose
+        /// offsets keep the original OCS scaling of a fixed 128 bytes per tile, the
+        /// 4-bitplane tile size, whatever the real depth is. At 4 bitplanes the two are
+        /// the same number, which is why it went unnoticed.
+        ///
+        /// Both are unambiguous once you check them against the file: a stride only fits
+        /// if every offset is a multiple of it AND lands on a tile that exists. So try
+        /// the byte stride first and fall back to the legacy one.
+        /// </summary>
+        static int DetectPitchOffsetStride(Mapping[,] mapping, int bitplanes, int spriteCount)
+        {
+            int byteStride = TileSize * bitplanes * 2;   // what WritePitchMap emits
+            const int LegacyStride = TileSize * 4 * 2;   // 128 - fixed 4-bitplane tile size
 
-            if (bytesPerTile <= 0)
-                throw new ArgumentOutOfRangeException(nameof(bitplanes));
+            if (PitchOffsetsFitStride(mapping, byteStride, spriteCount))
+                return byteStride;
 
-            if ((offset % (uint)bytesPerTile) != 0)
+            if (LegacyStride != byteStride && PitchOffsetsFitStride(mapping, LegacyStride, spriteCount))
+                return LegacyStride;
+
+            // Neither fits; return the expected one so the per-cell decode below reports
+            // the offending offset rather than silently picking something wrong.
+            return byteStride;
+        }
+
+        static bool PitchOffsetsFitStride(Mapping[,] mapping, int stride, int spriteCount)
+        {
+            if (stride <= 0)
+                return false;
+
+            int rows = mapping.GetLength(0);
+            int cols = mapping.GetLength(1);
+
+            for (int y = 0; y < rows; y++)
+            {
+                for (int x = 0; x < cols; x++)
+                {
+                    uint offset = ReadPitchMappingOffset(mapping[y, x]);
+
+                    if ((offset % (uint)stride) != 0)
+                        return false;
+
+                    if (offset / (uint)stride >= (uint)spriteCount)
+                        return false;
+                }
+            }
+
+            return true;
+        }
+
+        static int DecodePitchTileIndex(Mapping m, int offsetStride)
+        {
+            uint offset = ReadPitchMappingOffset(m);
+
+            if (offsetStride <= 0)
+                throw new ArgumentOutOfRangeException(nameof(offsetStride));
+
+            if ((offset % (uint)offsetStride) != 0)
                 throw new InvalidOperationException(
-                    $"Bad pitch mapping offset 0x{offset:X8} (not divisible by bytesPerTile={bytesPerTile}).");
+                    $"Bad pitch mapping offset 0x{offset:X8} (not divisible by the tile stride of {offsetStride} bytes).");
 
-            return (int)(offset / (uint)bytesPerTile);
+            return (int)(offset / (uint)offsetStride);
         }
 
     }

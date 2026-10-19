@@ -13,6 +13,15 @@
 		<None Include="../LICENSE" Pack="true" PackagePath="\" />
 	</ItemGroup>
 
+	<!-- Jaguar assets: the hand-drawn art -jag2amiga lays over the cartridge's own
+	     sheets, plus the note telling you where the cartridge image goes. None of it
+	     can be regenerated, so it lives here and is copied out - never edited in
+	     bin/, which is gitignored. -->
+	<ItemGroup>
+		<Content Include="Jag\*.bmp" CopyToOutputDirectory="PreserveNewest" />
+		<Content Include="Jag\README.txt" CopyToOutputDirectory="PreserveNewest" />
+	</ItemGroup>
+
 	<PropertyGroup>
 		<Version>1.0.1</Version>
 		<AssemblyVersion>1.0.1.0</AssemblyVersion>

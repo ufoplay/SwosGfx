@@ -15,8 +15,8 @@ Tool for generating or extracting graphics data and palettes for SWOS (Amiga and
 
 ```bash
 SwosGfx -amiga -map -output=bmp  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.map out.bmp
-SwosGfx -amiga -map -output=tmx  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.map out.tmx
-SwosGfx -amiga -tmx -output=map  [-bitplanes=N]    [-no-rnc]      in.tmx out.map
+SwosGfx -amiga -map -output=tmj  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.map out.tmj
+SwosGfx -amiga -tmj -output=map  [-bitplanes=N]    [-no-rnc]      in.tmj out.map
 SwosGfx -amiga -bmp -output=map  [-bitplanes=N]    [-no-rnc]      fullPitch.bmp out.map
 SwosGfx -amiga -bmp -output=raw  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.bmp out.raw
 SwosGfx -amiga -raw -output=bmp  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.raw out.bmp
@@ -34,7 +34,7 @@ Supported batch conversions:
 ```bash
 SwosGfx -amiga -raw -output=bmp  [-palette=<name>] [-bitplanes=N] [-no-rnc] [outDir]
 SwosGfx -amiga -map -output=bmp  [-palette=<name>] [-bitplanes=N] [-no-rnc] [outDir]
-SwosGfx -amiga -map -output=tmx  [-palette=<name>] [-bitplanes=N] [-no-rnc] [outDir]
+SwosGfx -amiga -map -output=tmj  [-palette=<name>] [-bitplanes=N] [-no-rnc] [outDir]
 ```
 
 ---
@@ -52,17 +52,42 @@ This mode renders **all 6 pitches** (`pitch1..pitch6`) using the selected type.
 
 ```bash
 SwosGfx -dos -output=bmp [-pitch=N] [-type=normal] [-colors=N] [outDir]
-SwosGfx -dos -output=tmx [-pitch=N] [-type=normal] [-colors=N] [outDir]
+SwosGfx -dos -output=tmj [-pitch=N] [-type=normal] [-colors=N] [-insertblanktile] [-tilesetwidth=N] [outDir]
 ```
 
 Output filenames:
 
 * BMP: `pitchN-<type>.bmp`
-* TMX: `pitchN-<type>.tmx`
+* Tiled: `pitchN-<type>.tmj` plus `pitchN-<type>.bmp`, its 8bpp tileset image
 
 Where `<type>` is one of: `frozen, muddy, wet, soft, normal, dry, hard`.
 
 Note: `-pitch` currently exists as an option, but the current implementation renders pitches `1..6` in a loop.
+
+#### Tiled (`.tmj`) export
+
+A pitch is a 42x55 grid of 16x16 patterns, so `-output=tmj` writes the real tile map
+rather than a flattened picture: one tile layer plus a tileset image with the unique
+tiles. Maps are written in [Tiled's JSON map format](https://doc.mapeditor.org/en/stable/reference/json-map-format/)
+(`.tmj`) - one orthogonal tile layer, one embedded tileset with an external image, and
+the tile data as a plain array of GIDs. `-output=json` and `-output=tmx` are accepted as
+aliases and produce the same `.tmj` file.
+
+On input the format is detected from the file content rather than its extension, so the
+XML `.tmx` maps SwosGfx wrote before the switch still load (`-tmj`, `-json` and `-tmx`
+are all the same input switch).
+
+Patterns are deduplicated on pixel content, and the switches match the ones
+[Tiled2Bin](https://github.com/benbaker76/Tiled2Bin) uses for its `-slice` mode:
+
+| Option              | Description                                                                                                   | Default |
+| ------------------- | ------------------------------------------------------------------------------------------------------------- | ------- |
+| `-insertblanktile`  | Reserve tile id 0 for an all-transparent tile, so the map never contains gid 0 ("no tile").                    | `false` |
+| `-tilesetwidth=<n>` | Tileset image width in pixels (must be a multiple of 16). `256` gives the usual 16 tiles across.               | `256`   |
+
+`!Extract_DOS_Pitches_Tiled.bat` (in `bin/Debug/net8.0`) renders all 7 pitch types with
+`-insertblanktile` into `DOS_Pitches_Tiled`. The maps round-trip: feeding one back
+through `-amiga -tmj -output=map` reproduces the pitch pixel for pixel.
 
 ---
 
@@ -116,6 +141,73 @@ DOS sprite indices map to Amiga indices as `Amiga = DOS − 114` for gameplay sp
 layout, sourced from `TEAM1/TEAM2/TEAM3.DAT` respectively; `SOCCER_S` (the big R/S
 rotation) uses palette slots `0x70..0x7F`. Full-screen images with no DOS equivalent
 (`LOADER*`, `DISK22`, `OLDDISK1`, `MENUBG*`, `RAINBOW`) are not produced by this mode.
+
+---
+
+### Jaguar → Amiga bank conversion (`-jag2amiga`)
+
+The Atari Jaguar release (*Sensible Soccer International Edition*, 1995) ships its
+in-game artwork as nine LZ-packed `*.lzj` blobs, each unpacking to exactly 81920 bytes =
+one 320x256 8bpp sheet. Six of those sheets are the gameplay sprite banks, laid out at
+the **same pixel coordinates** the Amiga image-command scripts read from - the Jaguar
+port kept the Amiga bank layout and simply redrew the art at 256 colours.
+
+So this is `-dos2amiga` with a different pixel source: the same scripts are walked, but
+each placement is lifted straight out of the matching Jaguar sheet. SwosGfx reads the
+cartridge itself (it has its own `lz-bits` depacker and CRY colour conversion), so no
+external tooling is needed.
+
+```bash
+SwosGfx -dos -jag2amiga [-jag-rom=<path>] [-jag-dir=<path>] [outDir]
+```
+
+With no `-jag-rom`, the first `*.jag` / `*.j64` / `*.rom` / `*.bin` in `./Jag` is used.
+The DOS directory is still required - it supplies everything the Jaguar release lacks.
+
+| Amiga bank                          | Jaguar stream | Source                                                     |
+| ----------------------------------- | ------------- | ---------------------------------------------------------- |
+| `CJCGRAFS`                          | `$8947C0`     | Jaguar scoreboard font + clock captions only, rest from DOS |
+| `CJCTEAM1`                          | `$8AC828`     | Jaguar (303 / 303 with the celebration art)                 |
+| `CJCTEAM2`                          | `$8AFB58`     | Jaguar (303 / 303)                                          |
+| `CJCTEAM3`                          | `$8B2FE0`     | Jaguar (303 / 303)                                          |
+| `CJCTEAMG`                          | `$8A02E8`     | Jaguar (232 / 232 - exact)                                  |
+| `CJCBITS`                           | `$8993D8`     | Jaguar (24 / 30)                                            |
+| `CJCBENCH`                          | `$89D0B0`     | Jaguar (58 / 61)                                            |
+| `SOCCER_S`, `CHARSET`, `MENUS`, `MENUS2` | -        | DOS - the Jaguar has its own menu system                    |
+
+Anything the Jaguar sheets do not hold falls back to the DOS sprite, so the output is a
+complete drop-in set.
+
+#### Celebration frames
+
+The one gap in the Jaguar artwork is the goal **celebration** - Amiga sprites `251-256`,
+`352-357` and `453-458`, which all point at the same six cells at `(144,64)`-`(176,80)`.
+That whole 48x32 block is blank in all three Jaguar team sheets, because the Jaguar game
+has no celebration. It is supplied by hand-drawn Jaguar-style art:
+
+```
+Jag/CJCTEAM1_CELEB.bmp
+Jag/CJCTEAM2_CELEB.bmp
+Jag/CJCTEAM3_CELEB.bmp
+```
+
+Each is a 48x32 8bpp BMP - the bank block at `(144,64)`, a 3x2 grid of 16x16 cells whose
+top-left corners hold the six 12x15 sprites (the last is 11x15). It is stamped onto the
+sheet before the script walk, so the frames flow through the normal placement path and
+all three kit banks come out **303 / 303 from the Jaguar**, with no DOS fallback at all.
+
+Draw against the Jaguar palette (`JAG_GAME.act`, written next to the converted banks);
+art in another palette still works, it is matched onto the nearest Jaguar colours on the
+way in. Delete a `_CELEB.bmp` and that bank reverts to the DOS celebration sprites.
+
+Banks are written in the Jaguar in-game CRY palette (`$6FA42` in the cartridge), dumped
+next to them as `JAG_GAME.act`; DOS fallback sprites are remapped from the DOS Game
+palette onto the nearest Jaguar colours so each bank stays a single 256-colour image.
+The banks with no Jaguar source at all keep their DOS palette.
+
+`!Convert_Jag_to_Amiga.bat` (in `bin/Debug/net8.0`) runs the whole thing into
+`Amiga_Images_256_Jag`. Put the cartridge image in `Jag\`, or pass its path as the first
+argument. The ROM is not distributed with SwosGfx.
 
 ---
 
@@ -193,6 +285,11 @@ SwosGfx -font-extend [-glyphs=glyphs.txt] charset.bmp [out.bmp]
   * Picture files: `TITLE.256`, `SCORES.256`, `LOADSCR.256`
   * Sprite files: `SPRITE.DAT`, `CHARSET.DAT`, `SCORE.DAT`, `TEAM1.DAT`, `TEAM3.DAT"`, `GOAL1.DAT`, `GOAL1.DAT`, `BENCH.DAT`
 
+* Jaguar assets: `./Jag` (default, can be changed with `-jag-dir=<path>`)
+
+  * Cartridge image: `Sensible Soccer International Edition (1995).jag` (2,097,152 bytes), or point at one elsewhere with `-jag-rom=<path>`. Not distributed with SwosGfx.
+  * Celebration art: `CJCTEAM1_CELEB.bmp`, `CJCTEAM2_CELEB.bmp`, `CJCTEAM3_CELEB.bmp` (48x32, 8bpp)
+
 ## File Info (Amiga)
 
 | Name         | Size    | Size (4 bitplanes) | Size (8 bitplanes) |
@@ -240,6 +337,19 @@ SwosGfx -font-extend [-glyphs=glyphs.txt] charset.bmp [out.bmp]
 The Amiga map format consists of a 42 x 55 tile map followed immediately by the tile pixel data. The tile map is an array of 32-bit values, one per tile cell (42 * 55 = 2310 entries, 9240 bytes total). Each entry stores an offset (byte address) into the tile data block for the tile that should be drawn at that cell. In other words, the map does not store "tile indices" in the conventional sense; it stores pointers/offsets to the tile’s pixel payload within the tile data that follows.
 
 Directly after the 9240-byte tile map comes the tile data itself, stored as a contiguous stream of 16 x 16 pixel tiles in classic Amiga planar (bitplane) format using 4 bitplanes (16 colors). Each tile is encoded one scanline at a time: for each of the 16 rows, the data contains one 16-bit word per bitplane (because 16 pixels / 16 bits = 1 word). The planes are stored separately, and the final pixel color index is reconstructed by taking the corresponding bit from each plane (plane 0 is the least-significant bit), combining them into a 4-bit value in the range 0-15. This yields a per-tile storage size of 16 rows x 4 planes x 2 bytes = 128 bytes per tile, and the map entry offsets point to the start of these 128-byte tile records within the tile data stream.
+
+### Bit depth and the offset unit
+
+A MAP does not record its own bit depth, so `-bitplanes=N` has to match the file. Get it
+wrong and SwosGfx says so, and lists the depths the tile data would actually divide into —
+the AGA pitches in `Amiga/`, for example, are 7 bitplanes (224 bytes per tile), not 4.
+
+Two conventions for the map entries exist in the wild. SwosGfx writes a true byte offset,
+`tileIndex * 16 * bitplanes * 2`, but AGA pitches also exist whose entries keep the original
+OCS scaling of a fixed **128 bytes per tile** whatever the real depth is — at 4 bitplanes the
+two are the same number, which is why the difference is easy to miss. Reading works out which
+one a file uses by checking the whole table against both (a unit only fits if every entry is a
+multiple of it *and* lands on a tile that exists), so either loads without a switch.
 
 ## Palettes (Amiga)
 
@@ -313,9 +423,9 @@ For the pitch palettes each color is written to index 0, 7, 9, 78, 79, 80, 81, 1
 -dos-dir=<path>           DOS directory (default: ./DOS)
 
 # Amiga input types
--map | -tmx | -bmp | -raw Input type (Amiga only)
+-map | -tmj | -bmp | -raw Input type (Amiga only; -json and -tmx are aliases)
 
--output=bmp|tmx|map|raw   Output type
+-output=bmp|tmj|map|raw   Output type (Tiled maps are JSON; json/tmx are aliases)
 
 -palette=<name>           Palette (Amiga): Soft, Muddy, Frozen, Dry, Normal, Hard, Wet
 -bitplanes=N              Bitplanes 1-8 (default 4; 4=16 colors, 8=256)
@@ -326,12 +436,18 @@ For the pitch palettes each color is written to index 0, 7, 9, 78, 79, 80, 81, 1
 -pitch=N                  DOS pitch index (0..MaxPitch-1), default 0
 -type=name                DOS pitch type: frozen, muddy, wet, soft, normal, dry, hard
 -colors=N                 DOS: remap to N colors (16-256)
+-insertblanktile          DOS pitch -output=tmj: reserve tile id 0 as a blank tile
+-tilesetwidth=N           DOS pitch -output=tmj: tileset image width in pixels (default 256)
 
 # DOS mode switches
 -picture                  DOS: operate on a .256 picture file
 -sprites-export           DOS: export all sprites to sprNNNN.bmp files
 -sprites-import           DOS: import sprNNNN.bmp files into DAT/SPRITE.DAT
 -sprite-bg=N              DOS sprites: menu palette index for background color (in BMP slot 16)
+-dos2amiga                DOS: rebuild Amiga gameplay banks from DOS graphics
+-jag2amiga                Jaguar: rebuild Amiga gameplay banks from a Jaguar cartridge
+-jag-rom=<path>           Jaguar cartridge image (default: first ROM in ./Jag)
+-jag-dir=<path>           Jaguar directory (default: ./Jag)
 
 # General
 -h, -?                    Show help
@@ -402,8 +518,8 @@ SwosGfx -amiga -bmp -output=map -bitplanes=4 fullPitch.bmp SWCPICH1.MAP
 # Convert a RAW 320x256 planar dump to BMP using the "Normal" pitch palette (16 colors)
 SwosGfx -amiga -raw -output=bmp -palette=Normal -bitplanes=4 pitch.raw pitch-normal.bmp
 
-# Convert a Tiled .tmx back to Amiga .MAP (7 bitplanes for AGA)
-SwosGfx -amiga -tmx -output=map -bitplanes=7 pitch1-aga.tmx SWCPICH1.MAP
+# Convert a Tiled map back to Amiga .MAP (7 bitplanes for AGA)
+SwosGfx -amiga -tmj -output=map -bitplanes=7 pitch1-aga.tmj SWCPICH1.MAP
 ```
 
 ### More DOS examples
@@ -419,27 +535,43 @@ SwosGfx -dos -sprites-export -dos-dir=DOS -sprite-bg=0 sprites-out
 SwosGfx -dos -sprites-import sprites-out
 ```
 
-### DOS TMX examples
+### DOS Tiled examples
 
 ```bash
-# Render all DOS pitches, SOFT type, directly to Tiled .tmx files
-SwosGfx -dos -dos-dir=DOS -output=tmx -type=soft -colors=128 pitches-soft-tmx
+# Render all DOS pitches, SOFT type, directly to Tiled .tmj maps
+SwosGfx -dos -dos-dir=DOS -output=tmj -type=soft -colors=128 pitches-soft-tiled
 
-# Render all DOS pitches, DRY type, full 256 colors, directly to Tiled .tmx files
-SwosGfx -dos -dos-dir=DOS -output=tmx -type=dry -colors=256 pitches-dry-256-tmx
+# Render all DOS pitches, DRY type, full 256 colors, directly to Tiled .tmj maps
+SwosGfx -dos -dos-dir=DOS -output=tmj -type=dry -colors=256 pitches-dry-256-tiled
+
+# Render all DOS pitches, NORMAL type, with a blank tile at id 0 (Tiled2Bin -slice style)
+SwosGfx -dos -dos-dir=DOS -output=tmj -insertblanktile -type=normal DOS_Pitches_Tiled
+
+# Same, but with a 32-tile-wide tileset image instead of 16
+SwosGfx -dos -dos-dir=DOS -output=tmj -insertblanktile -tilesetwidth=512 -type=normal DOS_Pitches_Tiled
 ```
 
-### Amiga TMX examples
+### Jaguar examples
 
 ```bash
-# Convert an Amiga .MAP pitch (AGA, 7 bitplanes) to a Tiled .tmx map
-SwosGfx -amiga -map -output=tmx -palette=Normal -bitplanes=7 SWCPICH1.MAP pitch1-normal-aga.tmx
+# Rebuild the Amiga banks from a Jaguar cartridge sitting in ./Jag
+SwosGfx -dos -dos-dir=DOS -jag2amiga Amiga_Images_256_Jag
+
+# Same, pointing at a cartridge image somewhere else
+SwosGfx -dos -dos-dir=DOS -jag2amiga "-jag-rom=D:\roms\Sensible Soccer International Edition (1995).jag" Amiga_Images_256_Jag
+```
+
+### Amiga Tiled examples
+
+```bash
+# Convert an Amiga .MAP pitch (AGA, 7 bitplanes) to a Tiled .tmj map
+SwosGfx -amiga -map -output=tmj -palette=Normal -bitplanes=7 SWCPICH1.MAP pitch1-normal-aga.tmj
 
 # Same, but OCS/ECS 16-color pitch using 4 bitplanes
-SwosGfx -amiga -map -output=tmx -palette=Soft -bitplanes=4 SWCPICH2.MAP pitch2-soft-ecs.tmx
+SwosGfx -amiga -map -output=tmj -palette=Soft -bitplanes=4 SWCPICH2.MAP pitch2-soft-ecs.tmj
 
-# Take a TMX edited in Tiled and convert it back into an Amiga .MAP (AGA)
-SwosGfx -amiga -tmx -output=map -bitplanes=7 pitch1-normal-aga-edited.tmx SWCPICH1.MAP
+# Take a map edited in Tiled and convert it back into an Amiga .MAP (AGA)
+SwosGfx -amiga -tmj -output=map -bitplanes=7 pitch1-normal-aga-edited.tmj SWCPICH1.MAP
 ```
 
 ---

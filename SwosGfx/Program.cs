@@ -17,7 +17,7 @@ class Program
     {
         Unspecified,
         Map,
-        Tmx,
+        Tiled,
         Bmp,
         Raw
     }
@@ -26,7 +26,7 @@ class Program
     {
         Unspecified,
         Bmp,
-        Tmx,
+        Tiled,
         Map,
         Raw
     }
@@ -37,7 +37,8 @@ class Program
         Picture,
         SpritesExport,
         SpritesImport,
-        Dos2Amiga
+        Dos2Amiga,
+        Jag2Amiga
     }
 
     private sealed class CliOptions
@@ -61,6 +62,12 @@ class Program
         // DOS directory
         public string DosDirectory = "DOS";
 
+        // Jaguar cartridge (-jag2amiga): folder to look in, or an explicit path
+        public string JagDirectory = "Jag";
+        public string? JagRomPath;
+        public bool JagTemplate;
+        public bool JagDumpSheets;
+
         // DOS mode selection
         public DosMode DosMode = DosMode.Pitch;
 
@@ -68,6 +75,11 @@ class Program
         public int PitchIndex = 0;
         public PitchType PitchType = PitchType.Normal;
         public int DosColorCount = 256; // Reduce to N colors (16-256)
+
+        // DOS pitch -> Tiled JSON export. Names/defaults mirror Tiled2Bin's
+        // "-slice" switches so the two tools produce interchangeable maps.
+        public bool InsertBlankTile = false;
+        public int TilesetWidth = 256; // tileset image width in pixels (16 tiles across)
 
         // -picture -scale[=WxH]: bilinear-enlarge the .256 output to WxH (default the
         // Amiga full-screen 352x272). Used for the two DOS backdrops with no sprite
@@ -297,6 +309,33 @@ class Program
                 }
                 options.DosMode = DosMode.Dos2Amiga;
             }
+            else if (lower == "-jag2amiga")
+            {
+                if (options.DosMode != DosMode.Pitch)
+                {
+                    error = "Cannot specify multiple DOS modes (-picture, -sprites-export, -sprites-import, -dos2amiga, -jag2amiga).";
+                    return false;
+                }
+                options.DosMode = DosMode.Jag2Amiga;
+            }
+            else if (lower == "-jag-template")
+            {
+                options.JagTemplate = true;
+            }
+            else if (lower == "-jag-dump-sheets")
+            {
+                options.JagDumpSheets = true;
+            }
+            else if (lower.StartsWith("-jag-rom="))
+            {
+                // Preserve case (do not use 'lower' substring here)
+                options.JagRomPath = arg.Substring("-jag-rom=".Length);
+            }
+            else if (lower.StartsWith("-jag-dir="))
+            {
+                // Preserve case (do not use 'lower' substring here)
+                options.JagDirectory = arg.Substring("-jag-dir=".Length);
+            }
             else if (lower.StartsWith("-sprite-bg="))
             {
                 string value = lower.Substring("-sprite-bg=".Length);
@@ -316,14 +355,17 @@ class Program
                 }
                 options.Input = InputKind.Map;
             }
-            else if (lower == "-tmx")
+            else if (lower == "-tmj" || lower == "-json" || lower == "-tmx")
             {
-                if (options.Input != InputKind.Unspecified && options.Input != InputKind.Tmx)
+                // All three are the same input kind: the format is sniffed from the
+                // file, so the .tmj maps SwosGfx writes now and older .tmx files both
+                // load whichever switch you use.
+                if (options.Input != InputKind.Unspecified && options.Input != InputKind.Tiled)
                 {
-                    error = "Multiple input kinds specified. Use only one of: -map, -tmx, -bmp, -raw.";
+                    error = "Multiple input kinds specified. Use only one of: -map, -tmj, -bmp, -raw.";
                     return false;
                 }
-                options.Input = InputKind.Tmx;
+                options.Input = InputKind.Tiled;
             }
             else if (lower == "-bmp")
             {
@@ -357,8 +399,10 @@ class Program
                     case "bmp":
                         options.Output = OutputKind.Bmp;
                         break;
+                    case "tmj":
+                    case "json": // aliases; the Tiled output is JSON (.tmj) now
                     case "tmx":
-                        options.Output = OutputKind.Tmx;
+                        options.Output = OutputKind.Tiled;
                         break;
                     case "map":
                         options.Output = OutputKind.Map;
@@ -367,7 +411,7 @@ class Program
                         options.Output = OutputKind.Raw;
                         break;
                     default:
-                        error = $"Unknown output type '{value}'. Expected bmp, tmx, map, or raw.";
+                        error = $"Unknown output type '{value}'. Expected bmp, tmj, map, or raw.";
                         return false;
                 }
             }
@@ -437,6 +481,20 @@ class Program
                 }
                 options.AmigaColorCount = colorCount;
                 options.DosColorCount = colorCount;
+            }
+            else if (lower == "-insertblanktile")
+            {
+                options.InsertBlankTile = true;
+            }
+            else if (lower.StartsWith("-tilesetwidth="))
+            {
+                string value = lower.Substring("-tilesetwidth=".Length);
+                if (!int.TryParse(value, out int tilesetWidth) || tilesetWidth < 16 || (tilesetWidth % 16) != 0)
+                {
+                    error = $"Invalid tileset width '{value}'. Expected a multiple of 16 (pixels).";
+                    return false;
+                }
+                options.TilesetWidth = tilesetWidth;
             }
             else if (lower == "-palettes")
             {
@@ -611,7 +669,7 @@ class Program
                 // Batch mode: input comes from AmigaDirectory; optional one arg is output directory.
                 bool supported =
                     (options.Input == InputKind.Raw && options.Output == OutputKind.Bmp) ||
-                    (options.Input == InputKind.Map && (options.Output == OutputKind.Bmp || options.Output == OutputKind.Tmx));
+                    (options.Input == InputKind.Map && (options.Output == OutputKind.Bmp || options.Output == OutputKind.Tiled));
 
                 if (!supported)
                 {
@@ -639,7 +697,7 @@ class Program
                         return false;
                     }
 
-                    if (options.Output != OutputKind.Bmp && options.Output != OutputKind.Tmx)
+                    if (options.Output != OutputKind.Bmp && options.Output != OutputKind.Tiled)
                     {
                         error = "In -dos pitch mode, only -output=bmp or -output=tmx is supported.";
                         return false;
@@ -746,6 +804,22 @@ class Program
                         return false;
                     }
                     break;
+
+                case DosMode.Jag2Amiga:
+                    if (options.Input != InputKind.Unspecified)
+                    {
+                        error = "In -dos -jag2amiga mode, do not specify -map/-tmx/-bmp/-raw; input is the Jaguar cartridge plus the DOS folder.";
+                        return false;
+                    }
+
+                    // Output type is implicit (8bpp BMP banks); -output=... is ignored.
+                    // 0 args => current dir, 1 arg => output directory.
+                    if (options.Files.Count > 1)
+                    {
+                        error = $"In -dos -jag2amiga mode, expected 0 or 1 argument (output directory), got {options.Files.Count}.";
+                        return false;
+                    }
+                    break;
             }
         }
 
@@ -833,9 +907,9 @@ class Program
                             throw new ArgumentException("Invalid combination: -output=bmp requires -map or -raw as input.");
                     }
 
-                case OutputKind.Tmx:
+                case OutputKind.Tiled:
                     if (opts.Input != InputKind.Map)
-                        throw new ArgumentException("Invalid combination: -output=tmx requires -map as input.");
+                        throw new ArgumentException("Invalid combination: -output=tmj requires -map as input.");
 
                     {
                         (var pal, var newPal) = GetPaletteRequired(opts.Files[0]);
@@ -846,7 +920,7 @@ class Program
                 case OutputKind.Map:
                     switch (opts.Input)
                     {
-                        case InputKind.Tmx:
+                        case InputKind.Tiled:
                             conv.ConvertTiledToPitchMap(inputPath, outputPath, 284, opts.Bitplanes);
                             return 0;
 
@@ -855,7 +929,7 @@ class Program
                             return 0;
 
                         default:
-                            throw new ArgumentException("Invalid combination: -output=map requires -tmx or -bmp as input.");
+                            throw new ArgumentException("Invalid combination: -output=map requires -tmj or -bmp as input.");
                     }
 
                 case OutputKind.Raw:
@@ -890,11 +964,11 @@ class Program
             case OutputKind.Bmp:
                 outputExt = ".bmp";
                 break;
-            case OutputKind.Tmx:
-                outputExt = ".tmx";
+            case OutputKind.Tiled:
+                outputExt = TiledMap.Extension;
                 break;
             default:
-                throw new ArgumentException("Batch mode currently supports only -output=bmp or -output=tmx in Amiga mode.");
+                throw new ArgumentException("Batch mode currently supports only -output=bmp or -output=tmj in Amiga mode.");
         }
 
         switch (opts.Input)
@@ -906,7 +980,7 @@ class Program
                 break;
 
             case InputKind.Map:
-                if (opts.Output != OutputKind.Bmp && opts.Output != OutputKind.Tmx)
+                if (opts.Output != OutputKind.Bmp && opts.Output != OutputKind.Tiled)
                     throw new ArgumentException("Amiga batch: -map supports only -output=bmp or -output=tmx.");
                 inputGlob = "*.map";
                 break;
@@ -939,7 +1013,7 @@ class Program
                     }
                     break;
 
-                case OutputKind.Tmx:
+                case OutputKind.Tiled:
                     if (opts.Input != InputKind.Map)
                         throw new ArgumentException("Amiga batch: -output=tmx requires -map.");
                     {
@@ -971,11 +1045,11 @@ class Program
                     var pitchRenderer = new DosPitch(patterns);
 
                     string typeName = opts.PitchType.ToString().ToLowerInvariant();
-                    string ext = opts.Output == OutputKind.Bmp ? "bmp" : "tmx";
+                    string ext = opts.Output == OutputKind.Bmp ? ".bmp" : TiledMap.Extension;
 
                     for (int i = 0; i < 6; i++)
                     {
-                        string fileName = $"pitch{i + 1}-{typeName}.{ext}";
+                        string fileName = $"pitch{i + 1}-{typeName}{ext}";
                         string outPath = Path.Combine(outDir, fileName);
 
                         switch (opts.Output)
@@ -988,16 +1062,21 @@ class Program
                                     colorCount: opts.DosColorCount);
                                 break;
 
-                            case OutputKind.Tmx:
-                                pitchRenderer.SavePitchAsTmx(
+                            case OutputKind.Tiled:
+                                pitchRenderer.SavePitchAsTiled(
                                     pitchIndex: i,
                                     pitchType: opts.PitchType,
                                     path: outPath,
-                                    colorCount: opts.DosColorCount);
+                                    colorCount: opts.DosColorCount,
+                                    options: new PitchTiledOptions
+                                    {
+                                        InsertBlankTile = opts.InsertBlankTile,
+                                        TilesetWidth = opts.TilesetWidth
+                                    });
                                 break;
 
                             default:
-                                throw new ArgumentException("In -dos pitch mode, only -output=bmp or -output=tmx are supported.");
+                                throw new ArgumentException("In -dos pitch mode, only -output=bmp or -output=tmj are supported.");
                         }
                     }
 
@@ -1105,9 +1184,71 @@ class Program
                     return DosToAmiga.ConvertBanks(dosDir, outDir);
                 }
 
+            case DosMode.Jag2Amiga:
+                {
+                    string outDir = opts.Files.Count == 0 ? Environment.CurrentDirectory : opts.Files[0];
+                    if (string.IsNullOrWhiteSpace(outDir))
+                        outDir = Environment.CurrentDirectory;
+
+                    string jagDir = ResolveJagDir(appPath, opts);
+                    string romPath = ResolveJagRom(jagDir, opts);
+
+                    return JagToAmiga.ConvertBanks(dosDir, romPath, jagDir, outDir,
+                                                   opts.JagTemplate, opts.JagDumpSheets);
+                }
+
             default:
                 throw new ArgumentOutOfRangeException();
         }
+    }
+
+    /// <summary>
+    /// The Jaguar asset folder (-jag-dir, default ./Jag): where the cartridge image
+    /// is looked for and where the &lt;bank&gt;_CELEB.bmp patches live.
+    /// </summary>
+    private static string ResolveJagDir(string appPath, CliOptions opts)
+    {
+        return Path.IsPathRooted(opts.JagDirectory)
+            ? opts.JagDirectory
+            : Path.Combine(appPath, opts.JagDirectory);
+    }
+
+    /// <summary>
+    /// Locate the Jaguar cartridge image: -jag-rom=&lt;path&gt; if given (absolute, or
+    /// relative to the app folder), otherwise the first .jag/.j64/.rom/.bin in the
+    /// Jaguar folder.
+    /// </summary>
+    private static string ResolveJagRom(string jagDir, CliOptions opts)
+    {
+        if (!string.IsNullOrWhiteSpace(opts.JagRomPath))
+        {
+            string given = opts.JagRomPath!;
+            if (File.Exists(given))
+                return given;
+
+            string underApp = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, given);
+            if (File.Exists(underApp))
+                return underApp;
+
+            throw new FileNotFoundException($"Jaguar ROM not found: {given}", given);
+        }
+
+        if (Directory.Exists(jagDir))
+        {
+            string[] extensions = { "*.jag", "*.j64", "*.rom", "*.bin" };
+
+            foreach (string extension in extensions)
+            {
+                string[] found = Directory.GetFiles(jagDir, extension);
+                Array.Sort(found, StringComparer.OrdinalIgnoreCase);
+
+                if (found.Length > 0)
+                    return found[0];
+            }
+        }
+
+        throw new FileNotFoundException(
+            $"No Jaguar cartridge found in '{jagDir}'. Put the ROM there, or pass -jag-rom=<path>.");
     }
 
     // ======================================================================
@@ -1123,8 +1264,8 @@ class Program
         Console.WriteLine();
         Console.WriteLine("Amiga usage:");
         Console.WriteLine("  SwosGfx -amiga -map    -output=bmp  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.map out.bmp");
-        Console.WriteLine("  SwosGfx -amiga -map    -output=tmx  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.map out.tmx");
-        Console.WriteLine("  SwosGfx -amiga -tmx    -output=map  [-bitplanes=N]    [-no-rnc]      in.tmx out.map");
+        Console.WriteLine("  SwosGfx -amiga -map    -output=tmj  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.map out.tmj");
+        Console.WriteLine("  SwosGfx -amiga -tmj    -output=map  [-bitplanes=N]    [-no-rnc]      in.tmj out.map");
         Console.WriteLine("  SwosGfx -amiga -bmp    -output=map  [-bitplanes=N]    [-no-rnc]      fullPitch.bmp out.map");
         Console.WriteLine("  SwosGfx -amiga -bmp    -output=raw  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.bmp out.raw");
         Console.WriteLine("  SwosGfx -amiga -raw    -output=bmp  [-palette=<name>] [-bitplanes=N] [-no-rnc] in.raw out.bmp");
@@ -1132,11 +1273,11 @@ class Program
         Console.WriteLine("Amiga batch usage (input from ./Amiga or -amiga-dir=..., output to current dir or optional outDir):");
         Console.WriteLine("  SwosGfx -amiga -raw -output=bmp  [-palette=<name>] [-bitplanes=N] [-no-rnc] [outDir]");
         Console.WriteLine("  SwosGfx -amiga -map -output=bmp  [-palette=<name>] [-bitplanes=N] [-no-rnc] [outDir]");
-        Console.WriteLine("  SwosGfx -amiga -map -output=tmx  [-palette=<name>] [-bitplanes=N] [-no-rnc] [outDir]");
+        Console.WriteLine("  SwosGfx -amiga -map -output=tmj  [-palette=<name>] [-bitplanes=N] [-no-rnc] [outDir]");
         Console.WriteLine();
         Console.WriteLine("DOS pitch usage (patterns from ./DOS):");
         Console.WriteLine("  SwosGfx -dos -output=bmp -pitch=N -type=normal  [-colors=N] [outDir]");
-        Console.WriteLine("  SwosGfx -dos -output=tmx -pitch=N -type=normal  [-colors=N] [outDir]");
+        Console.WriteLine("  SwosGfx -dos -output=tmj -pitch=N -type=normal  [-colors=N] [-insertblanktile] [-tilesetwidth=N] [outDir]");
         Console.WriteLine("    (pitch defaults: -pitch=0 -type=normal)");
         Console.WriteLine();
         Console.WriteLine("DOS picture usage (.256 → BMP):");
@@ -1158,6 +1299,23 @@ class Program
         Console.WriteLine("    CJCTEAM2, CJCTEAM3, CJCTEAMG, CJCBITS, SOCCER_S, CJCBENCH (gameplay,");
         Console.WriteLine("    Game palette), plus CHARSET, MENUS, MENUS2 (menu, Menu palette).");
         Console.WriteLine();
+        Console.WriteLine("Jaguar -> Amiga bank conversion (rebuild Amiga sprite banks from a cartridge):");
+        Console.WriteLine("  SwosGfx -dos -jag2amiga [-jag-rom=<path>] [outDir]");
+        Console.WriteLine("    Unpacks the Jaguar (Sensible Soccer International Edition) sprite sheets");
+        Console.WriteLine("    and lays them into the Amiga bank layout, writing 8bpp BMP banks in the");
+        Console.WriteLine("    Jaguar CRY palette (also dumped as JAG_GAME.act). Sprites the Jaguar");
+        Console.WriteLine("    release does not have - notably the goal celebration frames - fall back");
+        Console.WriteLine("    to the DOS graphics, so the folder is a complete set. Needs ./DOS too.");
+        Console.WriteLine("      -jag-template     also write <bank>_DOS.bmp (the whole original bank's");
+        Console.WriteLine("                        DOS art in the Jaguar palette), <bank>_TODO.bmp (only");
+        Console.WriteLine("                        the cells the Jaguar sheet has not got - the redraw");
+        Console.WriteLine("                        list) and <bank>_placements.csv.");
+        Console.WriteLine("      -jag-dump-sheets  also write <bank>_JAGSHEET.bmp, the raw unpacked");
+        Console.WriteLine("                        Jaguar sheet before the placement walk.");
+        Console.WriteLine("    Hand-drawn art goes back in as <jag-dir>/<bank>_PATCH.bmp, a whole");
+        Console.WriteLine("    320x256 bank whose non-zero pixels are laid over the Jaguar sheet;");
+        Console.WriteLine("    repaint <bank>_TODO.bmp and save it under that name.");
+        Console.WriteLine();
         Console.WriteLine("Font extend (add extended glyphs from glyphs.txt into a CHARSET bmp):");
         Console.WriteLine("  SwosGfx -font-extend [-glyphs=glyphs.txt] [-no-boxes] charset.bmp [out.bmp]");
         Console.WriteLine("    Draws the full-ASCII + accented glyphs into the free cells of the");
@@ -1171,8 +1329,8 @@ class Program
         Console.WriteLine("  -dos                      DOS mode");
         Console.WriteLine("  -amiga-dir=<path>         Amiga directory (default: ./Amiga)");
         Console.WriteLine("  -dos-dir=<path>           DOS directory (default: ./DOS)");
-        Console.WriteLine("  -map | -tmx | -bmp | -raw Input type (Amiga only)");
-        Console.WriteLine("  -output=bmp|tmx|map|raw   Output type");
+        Console.WriteLine("  -map | -tmj | -bmp | -raw Input type (Amiga only; -json and -tmx are aliases)");
+        Console.WriteLine("  -output=bmp|tmj|map|raw   Output type (Tiled maps are JSON; json/tmx are aliases)");
         Console.WriteLine("  -palette=<name>           Palette (Amiga): Soft, Muddy, Frozen, Dry, Normal, Hard, Wet");
         Console.WriteLine("  -bitplanes=N              Bitplanes 1-8 (default 4; 4=16 colors, 8=256)");
         Console.WriteLine("  -bitplanes=auto           Auto: 4 planes if image uses only colors 0-15, else 8 (-output=raw only)");
@@ -1180,10 +1338,15 @@ class Program
         Console.WriteLine("  -pitch=N                  DOS pitch index (0..MaxPitch-1), default 0");
         Console.WriteLine("  -type=name                DOS pitch type: frozen, muddy, wet, soft, normal, dry, hard");
         Console.WriteLine("  -colors=N                 DOS: remap to N colors (16-256)");
+        Console.WriteLine("  -insertblanktile          DOS pitch -output=tmj: reserve tile id 0 as a blank tile");
+        Console.WriteLine("  -tilesetwidth=N           DOS pitch -output=tmj: tileset image width in pixels (default 256)");
         Console.WriteLine("  -picture                  DOS: operate on a .256 picture file");
         Console.WriteLine("  -sprites-export           DOS: export all sprites to sprNNNN.bmp files");
         Console.WriteLine("  -sprites-import           DOS: import sprNNNN.bmp files into DAT/SPRITE.DAT");
         Console.WriteLine("  -dos2amiga                DOS: rebuild Amiga gameplay banks from DOS graphics");
+        Console.WriteLine("  -jag2amiga                Jaguar: rebuild Amiga gameplay banks from a Jaguar cartridge");
+        Console.WriteLine("  -jag-rom=<path>           Jaguar cartridge image (default: first ROM in ./Jag)");
+        Console.WriteLine("  -jag-dir=<path>           Jaguar directory (default: ./Jag)");
         Console.WriteLine("  -sprite-bg=N              DOS sprites: menu palette index for background color (in BMP slot 16)");
         Console.WriteLine("  -h, -?                    Show this help");
         Console.WriteLine();
